@@ -1,7 +1,7 @@
 import 'styled-components/macro';
 import React from 'react';
 import { t } from '@lingui/macro';
-import ProjectHelpTextStrings from '../Project.helptext';
+import getProjectHelpStrings from '../Project.helptext';
 
 import {
   UrlFormField,
@@ -15,7 +15,7 @@ const SvnSubForm = ({
   onCredentialSelection,
   scmUpdateOnLaunch,
 }) => {
-  const projectHelpStrings = ProjectHelpTextStrings();
+  const projectHelpStrings = getProjectHelpStrings();
   return (
     <>
       <UrlFormField tooltip={projectHelpStrings.svnSourceControlUrl} />

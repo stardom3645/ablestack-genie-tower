@@ -1,12 +1,9 @@
 import React from 'react';
 import { t } from '@lingui/macro';
-import getDocsBaseUrl from 'util/getDocsBaseUrl';
-import { useConfig } from 'contexts/Config';
-import useBrandName from 'hooks/useBrandName';
 
-const ProjectHelpTextStrings = () => ({
+const projectHelpTextStrings = () => ({
   executionEnvironment: t`The execution environment that will be used for jobs that use this project. This will be used as fallback when an execution environment has not been explicitly assigned at the job template or workflow level.`,
-  projectBasePath: (
+  projectBasePath: (brandName = '') => (
     <span>
       {t`Base path used for locating playbooks. Directories
               found inside this path will be listed in the playbook directory drop-down.
@@ -15,7 +12,7 @@ const ProjectHelpTextStrings = () => ({
       <br />
       <br />
       {t`Change PROJECTS_ROOT when deploying
-              ${useBrandName()} to change this location.`}
+              ${brandName} to change this location.`}
     </span>
   ),
   projectLocalPath: t`Select from the list of directories found in
@@ -74,7 +71,7 @@ const ProjectHelpTextStrings = () => ({
     </span>
   ),
 
-  sourceControlRefspec: (
+  sourceControlRefspec: (url = '') => (
     <span>
       {t`A refspec to fetch (passed to the Ansible git
             module). This parameter allows access to references via
@@ -99,13 +96,7 @@ const ProjectHelpTextStrings = () => ({
       <br />
       <br />
       {t`For more information, refer to the`}{' '}
-      <a
-        target="_blank"
-        rel="noopener noreferrer"
-        href={`${getDocsBaseUrl(
-          useConfig()
-        )}/html/userguide/projects.html#manage-playbooks-using-source-control`}
-      >
+      <a target="_blank" rel="noopener noreferrer" href={`${url}`}>
         {t`Documentation.`}
       </a>
     </span>
@@ -114,6 +105,10 @@ const ProjectHelpTextStrings = () => ({
         you can input tags, commit hashes, and arbitrary refs. Some
         commit hashes and refs may not be available unless you also
         provide a custom refspec.`,
+  signatureValidation: t`Enable content signing to verify that the content 
+                    has remained secure when a project is synced. 
+                    If the content has been tampered with, the 
+                    job will not run.`,
   options: {
     clean: t`Remove any local modifications prior to performing an update.`,
     delete: t`Delete the local repository in its entirety prior to
@@ -139,4 +134,4 @@ const ProjectHelpTextStrings = () => ({
   },
 });
 
-export default ProjectHelpTextStrings;
+export default projectHelpTextStrings;

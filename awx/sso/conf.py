@@ -1216,6 +1216,54 @@ register(
 )
 
 ###############################################################################
+# Generic OIDC AUTHENTICATION SETTINGS
+###############################################################################
+
+register(
+    'SOCIAL_AUTH_OIDC_KEY',
+    field_class=fields.CharField,
+    allow_null=False,
+    default=None,
+    label=_('OIDC Key'),
+    help_text='The OIDC key (Client ID) from your IDP.',
+    category=_('Generic OIDC'),
+    category_slug='oidc',
+)
+
+register(
+    'SOCIAL_AUTH_OIDC_SECRET',
+    field_class=fields.CharField,
+    allow_blank=True,
+    default='',
+    label=_('OIDC Secret'),
+    help_text=_('The OIDC secret (Client Secret) from your IDP.'),
+    category=_('Generic OIDC'),
+    category_slug='oidc',
+    encrypted=True,
+)
+
+register(
+    'SOCIAL_AUTH_OIDC_OIDC_ENDPOINT',
+    field_class=fields.CharField,
+    allow_blank=True,
+    default='',
+    label=_('OIDC Provider URL'),
+    help_text=_('The URL for your OIDC provider including the path up to /.well-known/openid-configuration'),
+    category=_('Generic OIDC'),
+    category_slug='oidc',
+)
+
+register(
+    'SOCIAL_AUTH_OIDC_VERIFY_SSL',
+    field_class=fields.BooleanField,
+    default=True,
+    label=_('Verify OIDC Provider Certificate'),
+    help_text=_('Verify the OIDV provider ssl certificate.'),
+    category=_('Generic OIDC'),
+    category_slug='oidc',
+)
+
+###############################################################################
 # SAML AUTHENTICATION SETTINGS
 ###############################################################################
 
@@ -1535,11 +1583,13 @@ register(
     category_slug='saml',
     placeholder=[
         ('is_superuser_attr', 'saml_attr'),
-        ('is_superuser_value', 'value'),
-        ('is_superuser_role', 'saml_role'),
+        ('is_superuser_value', ['value']),
+        ('is_superuser_role', ['saml_role']),
+        ('remove_superusers', True),
         ('is_system_auditor_attr', 'saml_attr'),
-        ('is_system_auditor_value', 'value'),
-        ('is_system_auditor_role', 'saml_role'),
+        ('is_system_auditor_value', ['value']),
+        ('is_system_auditor_role', ['saml_role']),
+        ('remove_system_auditors', True),
     ],
 )
 

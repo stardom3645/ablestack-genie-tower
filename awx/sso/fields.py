@@ -149,6 +149,7 @@ class AuthenticationBackendsField(fields.StringListField):
             ('awx.sso.backends.RADIUSBackend', ['RADIUS_SERVER']),
             ('social_core.backends.google.GoogleOAuth2', ['SOCIAL_AUTH_GOOGLE_OAUTH2_KEY', 'SOCIAL_AUTH_GOOGLE_OAUTH2_SECRET']),
             ('social_core.backends.github.GithubOAuth2', ['SOCIAL_AUTH_GITHUB_KEY', 'SOCIAL_AUTH_GITHUB_SECRET']),
+            ('social_core.backends.open_id_connect.OpenIdConnectAuth', ['SOCIAL_AUTH_OIDC_KEY', 'SOCIAL_AUTH_OIDC_SECRET', 'SOCIAL_AUTH_OIDC_OIDC_ENDPOINT']),
             (
                 'social_core.backends.github.GithubOrganizationOAuth2',
                 ['SOCIAL_AUTH_GITHUB_ORG_KEY', 'SOCIAL_AUTH_GITHUB_ORG_SECRET', 'SOCIAL_AUTH_GITHUB_ORG_NAME'],
@@ -741,10 +742,12 @@ class SAMLTeamAttrField(HybridDictField):
 class SAMLUserFlagsAttrField(HybridDictField):
 
     is_superuser_attr = fields.CharField(required=False, allow_null=True)
-    is_superuser_value = fields.CharField(required=False, allow_null=True)
-    is_superuser_role = fields.CharField(required=False, allow_null=True)
+    is_superuser_value = fields.StringListField(required=False, allow_null=True)
+    is_superuser_role = fields.StringListField(required=False, allow_null=True)
+    remove_superusers = fields.BooleanField(required=False, allow_null=True)
     is_system_auditor_attr = fields.CharField(required=False, allow_null=True)
-    is_system_auditor_value = fields.CharField(required=False, allow_null=True)
-    is_system_auditor_role = fields.CharField(required=False, allow_null=True)
+    is_system_auditor_value = fields.StringListField(required=False, allow_null=True)
+    is_system_auditor_role = fields.StringListField(required=False, allow_null=True)
+    remove_system_auditors = fields.BooleanField(required=False, allow_null=True)
 
     child = _Forbidden()

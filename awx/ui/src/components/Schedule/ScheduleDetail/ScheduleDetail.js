@@ -1,9 +1,7 @@
 import 'styled-components/macro';
 import React, { useCallback, useEffect } from 'react';
 import { Link, useHistory, useLocation } from 'react-router-dom';
-import { RRule, rrulestr } from 'rrule';
 import styled from 'styled-components';
-
 import { t } from '@lingui/macro';
 import { Chip, Divider, Title, Button } from '@patternfly/react-core';
 import { Schedule } from 'types';
@@ -11,6 +9,9 @@ import { formatDateString } from 'util/dates';
 import useRequest, { useDismissableError } from 'hooks/useRequest';
 import { JobTemplatesAPI, SchedulesAPI, WorkflowJobTemplatesAPI } from 'api';
 import { parseVariableField, jsonToYaml } from 'util/yaml';
+import { useConfig } from 'contexts/Config';
+import parseRuleObj from '../shared/parseRuleObj';
+import FrequencyDetails from './FrequencyDetails';
 import AlertModal from '../../AlertModal';
 import { CardBody, CardActionsRow } from '../../Card';
 import ContentError from '../../ContentError';
@@ -23,6 +24,8 @@ import DeleteButton from '../../DeleteButton';
 import ErrorDetail from '../../ErrorDetail';
 import ChipGroup from '../../ChipGroup';
 import { VariablesDetail } from '../../CodeEditor';
+import { VERBOSITY } from '../../VerbositySelectField';
+import getHelpText from '../../../screens/Template/shared/JobTemplate.helptext';
 
 const PromptDivider = styled(Divider)`
   margin-top: var(--pf-global--spacer--lg);
@@ -37,6 +40,29 @@ const PromptTitle = styled(Title)`
 
 const PromptDetailList = styled(DetailList)`
   padding: 0px 20px;
+`;
+
+const FrequencyDetailsContainer = styled.div`
+  background-color: var(--pf-global--palette--black-150);
+  margin-top: var(--pf-global--spacer--lg);
+  margin-bottom: var(--pf-global--spacer--lg);
+  margin-right: calc(var(--pf-c-card--child--PaddingRight) * -1);
+  margin-left: calc(var(--pf-c-card--child--PaddingLeft) * -1);
+  padding: var(--pf-c-card--child--PaddingRight);
+
+  & > p {
+    margin-bottom: var(--pf-global--spacer--md);
+  }
+
+  & > *:not(:first-child):not(:last-child) {
+    margin-bottom: var(--pf-global--spacer--md);
+    padding-bottom: var(--pf-global--spacer--md);
+    border-bottom: 1px solid var(--pf-global--palette--black-300);
+  }
+
+  & + & {
+    margin-top: calc(var(--pf-global--spacer--lg) * -1);
+  }
 `;
 
 function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
@@ -62,18 +88,11 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
     timezone,
     verbosity,
   } = schedule;
-
+  const helpText = getHelpText();
   const history = useHistory();
   const { pathname } = useLocation();
   const pathRoot = pathname.substr(0, pathname.indexOf('schedules'));
-
-  const VERBOSITY = {
-    0: t`0 (Normal)`,
-    1: t`1 (Verbose)`,
-    2: t`2 (More Verbose)`,
-    3: t`3 (Debug)`,
-    4: t`4 (Connection Debug)`,
-  };
+  const config = useConfig();
 
   const {
     request: deleteSchedule,
@@ -137,19 +156,22 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
     fetchCredentialsAndPreview();
   }, [fetchCredentialsAndPreview]);
 
-  const rule = rrulestr(rrule);
-  let repeatFrequency =
-    rule.options.freq === RRule.MINUTELY && dtstart === dtend
-      ? t`None (Run Once)`
-      : rule.toText().replace(/^\w/, (c) => c.toUpperCase());
-  // We should allow rrule tot handle this issue, and they have in version 2.6.8.
-  // (https://github.com/jakubroztocil/rrule/commit/ab9c564a83de2f9688d6671f2a6df273ceb902bf)
-  // However, we are unable to upgrade to that version because that
-  // version throws and unexpected warning.
-  // (https://github.com/jakubroztocil/rrule/issues/427)
-  if (repeatFrequency.split(' ')[1] === 'minutes') {
-    repeatFrequency = t`Every minute for ${rule.options.count} times`;
-  }
+  const frequencies = {
+    minute: t`Minute`,
+    hour: t`Hour`,
+    day: t`Day`,
+    week: t`Week`,
+    month: t`Month`,
+    year: t`Year`,
+  };
+  const { frequency, frequencyOptions, exceptionFrequency, exceptionOptions } =
+    parseRuleObj(schedule);
+  const repeatFrequency = frequency.length
+    ? frequency.map((f) => frequencies[f]).join(', ')
+    : t`None (Run Once)`;
+  const exceptionRepeatFrequency = exceptionFrequency.length
+    ? exceptionFrequency.map((f) => frequencies[f]).join(', ')
+    : t`None (Run Once)`;
 
   const {
     ask_credential_on_launch,
@@ -216,7 +238,7 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
   const showLimitDetail = ask_limit_on_launch && limit;
   const showJobTypeDetail = ask_job_type_on_launch && job_type;
   const showSCMBranchDetail = ask_scm_branch_on_launch && scm_branch;
-  const showVerbosityDetail = ask_verbosity_on_launch && VERBOSITY[verbosity];
+  const showVerbosityDetail = ask_verbosity_on_launch && VERBOSITY()[verbosity];
 
   const showPromptedFields =
     showCredentialsDetail ||
@@ -256,21 +278,84 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
         isDisabled={isDisabled}
       />
       <DetailList gutter="sm">
-        <Detail label={t`Name`} value={name} />
-        <Detail label={t`Description`} value={description} />
+        <Detail label={t`Name`} value={name} dataCy="schedule-name" />
+        <Detail
+          label={t`Description`}
+          value={description}
+          dataCy="schedule-description"
+        />
         <Detail
           label={t`First Run`}
           value={formatDateString(dtstart, timezone)}
+          dataCy="schedule-first-run"
         />
         <Detail
           label={t`Next Run`}
           value={formatDateString(next_run, timezone)}
+          dataCy="schedule-next-run"
         />
         <Detail label={t`Last Run`} value={formatDateString(dtend, timezone)} />
-        <Detail label={t`Local Time Zone`} value={timezone} />
-        <Detail label={t`Repeat Frequency`} value={repeatFrequency} />
+        <Detail
+          label={t`Local Time Zone`}
+          value={timezone}
+          helpText={helpText.localTimeZone(config)}
+          dataCy="schedule-timezone"
+        />
+        <Detail
+          label={t`Repeat Frequency`}
+          value={repeatFrequency}
+          dataCy="schedule-repeat-frequency"
+        />
+        <Detail
+          label={t`Exception Frequency`}
+          value={exceptionRepeatFrequency}
+          dataCy="schedule-exception-frequency"
+        />
+      </DetailList>
+      {frequency.length ? (
+        <FrequencyDetailsContainer>
+          <div ouia-component-id="schedule-frequency-details">
+            <p>
+              <strong>{t`Frequency Details`}</strong>
+            </p>
+            {frequency.map((freq) => (
+              <FrequencyDetails
+                key={freq}
+                type={freq}
+                label={frequencies[freq]}
+                options={frequencyOptions[freq]}
+                timezone={timezone}
+              />
+            ))}
+          </div>
+        </FrequencyDetailsContainer>
+      ) : null}
+      {exceptionFrequency.length ? (
+        <FrequencyDetailsContainer>
+          <div ouia-component-id="schedule-exception-details">
+            <p css="border-top: 0">
+              <strong>{t`Frequency Exception Details`}</strong>
+            </p>
+            {exceptionFrequency.map((freq) => (
+              <FrequencyDetails
+                key={freq}
+                type={freq}
+                label={frequencies[freq]}
+                options={exceptionOptions[freq]}
+                timezone={timezone}
+                isException
+              />
+            ))}
+          </div>
+        </FrequencyDetailsContainer>
+      ) : null}
+      <DetailList gutter="sm">
         {hasDaysToKeepField ? (
-          <Detail label={t`Days of Data to Keep`} value={daysToKeep} />
+          <Detail
+            label={t`Days of Data to Keep`}
+            value={daysToKeep}
+            dataCy="schedule-days-to-keep"
+          />
         ) : null}
         <ScheduleOccurrences preview={preview} tz={timezone} />
         <UserDateDetail
@@ -290,7 +375,11 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
           <PromptDivider />
           <PromptDetailList>
             {ask_job_type_on_launch && (
-              <Detail label={t`Job Type`} value={job_type} />
+              <Detail
+                label={t`Job Type`}
+                value={job_type}
+                dataCy="shedule-job-type"
+              />
             )}
             {showInventoryDetail && (
               <Detail
@@ -310,19 +399,31 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
                     ' '
                   )
                 }
+                dataCy="schedule-inventory"
               />
             )}
             {ask_verbosity_on_launch && (
-              <Detail label={t`Verbosity`} value={VERBOSITY[verbosity]} />
+              <Detail
+                label={t`Verbosity`}
+                value={VERBOSITY()[verbosity]}
+                dataCy="schedule-verbosity"
+              />
             )}
             {ask_scm_branch_on_launch && (
-              <Detail label={t`Source Control Branch`} value={scm_branch} />
+              <Detail
+                label={t`Source Control Branch`}
+                value={scm_branch}
+                dataCy="schedule-scm-branch"
+              />
             )}
-            {ask_limit_on_launch && <Detail label={t`Limit`} value={limit} />}
+            {ask_limit_on_launch && (
+              <Detail label={t`Limit`} value={limit} dataCy="schedule-limit" />
+            )}
             {showDiffModeDetail && (
               <Detail
                 label={t`Show Changes`}
                 value={diff_mode ? t`On` : t`Off`}
+                dataCy="schedule-show-changes"
               />
             )}
             {showCredentialsDetail && (
@@ -345,6 +446,7 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
                     ))}
                   </ChipGroup>
                 }
+                dataCy="schedule-credentials"
               />
             )}
             {showTagsDetail && (
@@ -368,6 +470,7 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
                     ))}
                   </ChipGroup>
                 }
+                dataCy="schedule-job-tags"
               />
             )}
             {showSkipTagsDetail && (
@@ -391,6 +494,7 @@ function ScheduleDetail({ hasDaysToKeepField, schedule, surveyConfig }) {
                     ))}
                   </ChipGroup>
                 }
+                dataCy="schedule-skip-tags"
               />
             )}
             {showVariablesDetail && (

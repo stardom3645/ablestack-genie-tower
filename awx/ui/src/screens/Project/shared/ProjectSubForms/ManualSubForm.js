@@ -8,16 +8,15 @@ import AnsibleSelect from 'components/AnsibleSelect';
 import FormField from 'components/FormField';
 import Popover from 'components/Popover';
 import useBrandName from 'hooks/useBrandName';
-import ProjectHelpStrings from '../Project.helptext';
+import getProjectHelpStrings from '../Project.helptext';
 
 const ManualSubForm = ({
   localPath,
   project_base_dir,
   project_local_paths,
 }) => {
+  const projectHelpStrings = getProjectHelpStrings();
   const brandName = useBrandName();
-  const projectHelpStrings = ProjectHelpStrings();
-
   const localPaths = [...new Set([...project_local_paths, localPath])];
   const options = [
     {
@@ -63,7 +62,7 @@ const ManualSubForm = ({
         name="base_dir"
         type="text"
         isReadOnly
-        tooltip={projectHelpStrings.projectBasePath}
+        tooltip={projectHelpStrings.projectBasePath(brandName)}
       />
       <FormGroup
         fieldId="project-local-path"

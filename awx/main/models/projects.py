@@ -284,6 +284,17 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         help_text=_('Allow changing the SCM branch or revision in a job template ' 'that uses this project.'),
     )
 
+    # credential (keys) used to validate content signature
+    signature_validation_credential = models.ForeignKey(
+        'Credential',
+        related_name='%(class)ss_signature_validation',
+        blank=True,
+        null=True,
+        default=None,
+        on_delete=models.SET_NULL,
+        help_text=_('An optional credential used for validating files in the project against unexpected changes.'),
+    )
+
     scm_revision = models.CharField(
         max_length=1024,
         blank=True,
@@ -354,7 +365,7 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
         # If update_fields has been specified, add our field names to it,
         # if it hasn't been specified, then we're just doing a normal save.
         update_fields = kwargs.get('update_fields', [])
-        skip_update = bool(kwargs.pop('skip_update', False))
+        self._skip_update = bool(kwargs.pop('skip_update', False))
         # Create auto-generated local path if project uses SCM.
         if self.pk and self.scm_type and not self.local_path.startswith('_'):
             slug_name = slugify(str(self.name)).replace(u'-', u'_')
@@ -372,14 +383,16 @@ class Project(UnifiedJobTemplate, ProjectOptions, ResourceMixin, CustomVirtualEn
                 from awx.main.signals import disable_activity_stream
 
                 with disable_activity_stream():
-                    self.save(update_fields=update_fields)
+                    self.save(update_fields=update_fields, skip_update=self._skip_update)
         # If we just created a new project with SCM, start the initial update.
         # also update if certain fields have changed
         relevant_change = any(pre_save_vals.get(fd_name, None) != self._prior_values_store.get(fd_name, None) for fd_name in self.FIELDS_TRIGGER_UPDATE)
-        if (relevant_change or new_instance) and (not skip_update) and self.scm_type:
+        if (relevant_change or new_instance) and (not self._skip_update) and self.scm_type:
             self.update()
 
     def _get_current_status(self):
+        if getattr(self, '_skip_update', False):
+            return self.status
         if self.scm_type:
             if self.current_job and self.current_job.status:
                 return self.current_job.status
@@ -511,6 +524,9 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         help_text=_('The SCM Revision discovered by this update for the given project and branch.'),
     )
 
+    def _set_default_dependencies_processed(self):
+        self.dependencies_processed = True
+
     def _get_parent_field_name(self):
         return 'project'
 
@@ -558,8 +574,7 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
             return UnpartitionedProjectUpdateEvent
         return ProjectUpdateEvent
 
-    @property
-    def task_impact(self):
+    def _get_task_impact(self):
         return 0 if self.job_type == 'run' else 1
 
     @property
@@ -616,6 +631,10 @@ class ProjectUpdate(UnifiedJob, ProjectOptions, JobNotificationMixin, TaskManage
         added_update_fields = []
         if not self.job_tags:
             job_tags = ['update_{}'.format(self.scm_type), 'install_roles', 'install_collections']
+            if self.project.signature_validation_credential is not None:
+                credential_type = self.project.signature_validation_credential.credential_type.namespace
+                job_tags.append(f'validation_{credential_type}')
+                job_tags.append('validation_checksum_manifest')
             self.job_tags = ','.join(job_tags)
             added_update_fields.append('job_tags')
         if self.scm_delete_on_update and 'delete' not in self.job_tags and self.job_type == 'check':

@@ -6,13 +6,14 @@ import os
 import stat
 
 # Django
-from django.utils.timezone import now
 from django.conf import settings
 from django_guid import get_guid
+from django.utils.functional import cached_property
+from django.db import connections
 
 # AWX
 from awx.main.redact import UriCleaner
-from awx.main.constants import MINIMAL_EVENTS
+from awx.main.constants import MINIMAL_EVENTS, ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE
 from awx.main.utils.update_model import update_model
 from awx.main.queue import CallbackQueueDispatcher
 
@@ -20,8 +21,6 @@ logger = logging.getLogger('awx.main.tasks.callback')
 
 
 class RunnerCallback:
-    event_data_key = 'job_id'
-
     def __init__(self, model=None):
         self.parent_workflow_job_id = None
         self.host_map = {}
@@ -33,9 +32,39 @@ class RunnerCallback:
         self.event_ct = 0
         self.model = model
         self.update_attempts = int(settings.DISPATCHER_DB_DOWNTOWN_TOLLERANCE / 5)
+        self.wrapup_event_dispatched = False
+        self.extra_update_fields = {}
 
     def update_model(self, pk, _attempt=0, **updates):
         return update_model(self.model, pk, _attempt=0, _max_attempts=self.update_attempts, **updates)
+
+    @cached_property
+    def wrapup_event_type(self):
+        return self.instance.event_class.WRAPUP_EVENT
+
+    @cached_property
+    def event_data_key(self):
+        return self.instance.event_class.JOB_REFERENCE
+
+    def delay_update(self, skip_if_already_set=False, **kwargs):
+        """Stash fields that should be saved along with the job status change"""
+        for key, value in kwargs.items():
+            if key in self.extra_update_fields and skip_if_already_set:
+                continue
+            elif key in self.extra_update_fields and key in ('job_explanation', 'result_traceback'):
+                if str(value) in self.extra_update_fields.get(key, ''):
+                    continue  # if already set, avoid duplicating messages
+                # In the case of these fields, we do not want to lose any prior information, so combine values
+                self.extra_update_fields[key] = '\n'.join([str(self.extra_update_fields[key]), str(value)])
+            else:
+                self.extra_update_fields[key] = value
+
+    def get_delayed_update_fields(self):
+        """Return finalized dict of all fields that should be saved along with the job status change"""
+        self.extra_update_fields['emitted_events'] = self.event_ct
+        if 'got an unexpected keyword argument' in self.extra_update_fields.get('result_traceback', ''):
+            self.delay_update(result_traceback=ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE)
+        return self.extra_update_fields
 
     def event_handler(self, event_data):
         #
@@ -130,6 +159,9 @@ class RunnerCallback:
         elif self.recent_event_timings.maxlen:
             self.recent_event_timings.append(time.time())
 
+        if event_data.get('event', '') == self.wrapup_event_type:
+            self.wrapup_event_dispatched = True
+
         event_data.setdefault(self.event_data_key, self.instance.id)
         self.dispatcher.dispatch(event_data)
         self.event_ct += 1
@@ -138,25 +170,8 @@ class RunnerCallback:
         Handle artifacts
         '''
         if event_data.get('event_data', {}).get('artifact_data', {}):
-            self.instance.artifacts = event_data['event_data']['artifact_data']
-            self.instance.save(update_fields=['artifacts'])
+            self.delay_update(artifacts=event_data['event_data']['artifact_data'])
 
-        return False
-
-    def cancel_callback(self):
-        """
-        Ansible runner callback to tell the job when/if it is canceled
-        """
-        unified_job_id = self.instance.pk
-        self.instance = self.update_model(unified_job_id)
-        if not self.instance:
-            logger.error('unified job {} was deleted while running, canceling'.format(unified_job_id))
-            return True
-        if self.instance.cancel_flag or self.instance.status == 'canceled':
-            cancel_wait = (now() - self.instance.modified).seconds if self.instance.modified else 0
-            if cancel_wait > 5:
-                logger.warning('Request to cancel {} took {} seconds to complete.'.format(self.instance.log_format, cancel_wait))
-            return True
         return False
 
     def finished_callback(self, runner_obj):
@@ -170,6 +185,8 @@ class RunnerCallback:
         }
         event_data.setdefault(self.event_data_key, self.instance.id)
         self.dispatcher.dispatch(event_data)
+        if self.wrapup_event_type == 'EOF':
+            self.wrapup_event_dispatched = True
 
     def status_handler(self, status_data, runner_config):
         """
@@ -187,6 +204,8 @@ class RunnerCallback:
 
             with disable_activity_stream():
                 self.instance = self.update_model(self.instance.pk, job_args=json.dumps(runner_config.command), job_cwd=runner_config.cwd, job_env=job_env)
+            # We opened a connection just for that save, close it here now
+            connections.close_all()
         elif status_data['status'] == 'failed':
             # For encrypted ssh_key_data, ansible-runner worker will open and write the
             # ssh_key_data to a named pipe. Then, once the podman container starts, ssh-agent will
@@ -205,16 +224,10 @@ class RunnerCallback:
         elif status_data['status'] == 'error':
             result_traceback = status_data.get('result_traceback', None)
             if result_traceback:
-                from awx.main.signals import disable_activity_stream  # Circular import
-
-                with disable_activity_stream():
-                    self.instance = self.update_model(self.instance.pk, result_traceback=result_traceback)
+                self.delay_update(result_traceback=result_traceback)
 
 
 class RunnerCallbackForProjectUpdate(RunnerCallback):
-
-    event_data_key = 'project_update_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForProjectUpdate, self).__init__(*args, **kwargs)
         self.playbook_new_revision = None
@@ -231,9 +244,6 @@ class RunnerCallbackForProjectUpdate(RunnerCallback):
 
 
 class RunnerCallbackForInventoryUpdate(RunnerCallback):
-
-    event_data_key = 'inventory_update_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForInventoryUpdate, self).__init__(*args, **kwargs)
         self.end_line = 0
@@ -245,9 +255,6 @@ class RunnerCallbackForInventoryUpdate(RunnerCallback):
 
 
 class RunnerCallbackForAdHocCommand(RunnerCallback):
-
-    event_data_key = 'ad_hoc_command_id'
-
     def __init__(self, *args, **kwargs):
         super(RunnerCallbackForAdHocCommand, self).__init__(*args, **kwargs)
         self.host_map = {}
@@ -255,4 +262,4 @@ class RunnerCallbackForAdHocCommand(RunnerCallback):
 
 class RunnerCallbackForSystemJob(RunnerCallback):
 
-    event_data_key = 'system_job_id'
+    pass

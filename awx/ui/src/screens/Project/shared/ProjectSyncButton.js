@@ -11,9 +11,10 @@ import useRequest, { useDismissableError } from 'hooks/useRequest';
 import AlertModal from 'components/AlertModal';
 import ErrorDetail from 'components/ErrorDetail';
 import { ProjectsAPI } from 'api';
-import ProjectHelpTextStrings from './Project.helptext';
+import getProjectHelpStrings from './Project.helptext';
 
 function ProjectSyncButton({ projectId, lastJobStatus = null }) {
+  const projectHelpStrings = getProjectHelpStrings();
   const match = useRouteMatch();
 
   const { request: handleSync, error: syncError } = useRequest(
@@ -22,7 +23,6 @@ function ProjectSyncButton({ projectId, lastJobStatus = null }) {
     }, [projectId]),
     null
   );
-  const projectHelpStrings = ProjectHelpTextStrings();
   const { error, dismissError } = useDismissableError(syncError);
   const isDetailsView = match.url.endsWith('/details');
   const isDisabled = ['pending', 'waiting', 'running'].includes(lastJobStatus);

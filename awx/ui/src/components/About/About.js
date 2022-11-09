@@ -12,7 +12,7 @@ function About({ version, isOpen, onClose }) {
     if (typeof brandName === 'string' && brandName.length > 0) {
       text =
         brandName.indexOf('AWX') === -1
-          ? `${brandName} Automation Controller 1.0.0`
+          ? `${brandName} Automation Controller`
           : `${brandName} ${version}`;
     }
 
@@ -33,7 +33,8 @@ function About({ version, isOpen, onClose }) {
 
   const speechBubble = createSpeechBubble();
   const copyright = t`Copyright (c), ABLECLOUD.Co.Ltd`;
-  const redHatInc = t`ABLESTACK Cerato (v3.0.0)`;
+  const redHatInc = t`ABLESTACK`;
+
   return (
     <AboutModal
       isOpen={isOpen}
@@ -45,14 +46,6 @@ function About({ version, isOpen, onClose }) {
     >
       <pre>
         {speechBubble}
-        {`
-          \\
-          \\   ^__^
-              (oo)\\_______
-              (__)      A )\\
-                  ||----w |
-                  ||     ||
-                    `}
       </pre>
     </AboutModal>
   );

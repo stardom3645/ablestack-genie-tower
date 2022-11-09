@@ -13,6 +13,7 @@ from django.db import connection, models
 from django.conf import settings
 from django.utils.translation import gettext_lazy as _
 from django.core.exceptions import ObjectDoesNotExist
+from django.utils.timezone import now, timedelta
 
 # from django import settings as tower_settings
 
@@ -40,7 +41,7 @@ from awx.main.models.mixins import (
 from awx.main.models.jobs import LaunchTimeConfigBase, LaunchTimeConfig, JobTemplate
 from awx.main.models.credential import Credential
 from awx.main.redact import REPLACE_STR
-from awx.main.utils import schedule_task_manager
+from awx.main.utils import ScheduleWorkflowManager
 
 
 __all__ = [
@@ -318,8 +319,8 @@ class WorkflowJobNode(WorkflowNodeBase):
         for parent_node in self.get_parent_nodes():
             is_root_node = False
             aa_dict.update(parent_node.ancestor_artifacts)
-            if parent_node.job and hasattr(parent_node.job, 'artifacts'):
-                aa_dict.update(parent_node.job.artifacts)
+            if parent_node.job:
+                aa_dict.update(parent_node.job.get_effective_artifacts(parents_set=set([self.workflow_job_id])))
         if aa_dict and not is_root_node:
             self.ancestor_artifacts = aa_dict
             self.save(update_fields=['ancestor_artifacts'])
@@ -622,6 +623,9 @@ class WorkflowJob(UnifiedJob, WorkflowJobOptions, SurveyJobMixin, JobNotificatio
     )
     is_sliced_job = models.BooleanField(default=False)
 
+    def _set_default_dependencies_processed(self):
+        self.dependencies_processed = True
+
     @property
     def workflow_nodes(self):
         return self.workflow_job_nodes
@@ -659,10 +663,16 @@ class WorkflowJob(UnifiedJob, WorkflowJobOptions, SurveyJobMixin, JobNotificatio
                 node_job_description = 'job #{0}, "{1}", which finished with status {2}.'.format(node.job.id, node.job.name, node.job.status)
             str_arr.append("- node #{0} spawns {1}".format(node.id, node_job_description))
         result['body'] = '\n'.join(str_arr)
+        result.update(
+            dict(
+                inventory=self.inventory.name if self.inventory else None,
+                limit=self.limit,
+                extra_vars=self.display_extra_vars(),
+            )
+        )
         return result
 
-    @property
-    def task_impact(self):
+    def _get_task_impact(self):
         return 0
 
     def get_ancestor_workflows(self):
@@ -682,6 +692,27 @@ class WorkflowJob(UnifiedJob, WorkflowJobOptions, SurveyJobMixin, JobNotificatio
             wj = wj.get_workflow_job()
         return ancestors
 
+    def get_effective_artifacts(self, **kwargs):
+        """
+        For downstream jobs of a workflow nested inside of a workflow,
+        we send aggregated artifacts from the nodes inside of the nested workflow
+        """
+        artifacts = {}
+        job_queryset = (
+            UnifiedJob.objects.filter(unified_job_node__workflow_job=self)
+            .defer('job_args', 'job_cwd', 'start_args', 'result_traceback')
+            .order_by('finished', 'id')
+            .filter(status__in=['successful', 'failed'])
+            .iterator()
+        )
+        parents_set = kwargs.get('parents_set', set())
+        new_parents_set = parents_set | {self.id}
+        for job in job_queryset:
+            if job.id in parents_set:
+                continue
+            artifacts.update(job.get_effective_artifacts(parents_set=new_parents_set))
+        return artifacts
+
     def get_notification_templates(self):
         return self.workflow_job_template.notification_templates
 
@@ -692,11 +723,10 @@ class WorkflowJob(UnifiedJob, WorkflowJobOptions, SurveyJobMixin, JobNotificatio
     def preferred_instance_groups(self):
         return []
 
-    @property
-    def actually_running(self):
+    def cancel_dispatcher_process(self):
         # WorkflowJobs don't _actually_ run anything in the dispatcher, so
         # there's no point in asking the dispatcher if it knows about this task
-        return self.status == 'running'
+        return True
 
 
 class WorkflowApprovalTemplate(UnifiedJobTemplate, RelatedJobsMixin):
@@ -755,6 +785,12 @@ class WorkflowApproval(UnifiedJob, JobNotificationMixin):
         default=0,
         help_text=_("The amount of time (in seconds) before the approval node expires and fails."),
     )
+    expires = models.DateTimeField(
+        default=None,
+        null=True,
+        editable=False,
+        help_text=_("The time this approval will expire. This is the created time plus timeout, used for filtering."),
+    )
     timed_out = models.BooleanField(default=False, help_text=_("Shows when an approval node (with a timeout assigned to it) has timed out."))
     approved_or_denied_by = models.ForeignKey(
         'auth.User',
@@ -764,6 +800,9 @@ class WorkflowApproval(UnifiedJob, JobNotificationMixin):
         editable=False,
         on_delete=models.SET_NULL,
     )
+
+    def _set_default_dependencies_processed(self):
+        self.dependencies_processed = True
 
     @classmethod
     def _get_unified_job_template_class(cls):
@@ -782,13 +821,32 @@ class WorkflowApproval(UnifiedJob, JobNotificationMixin):
     def _get_parent_field_name(self):
         return 'workflow_approval_template'
 
+    def save(self, *args, **kwargs):
+        update_fields = list(kwargs.get('update_fields', []))
+        if self.timeout != 0 and ((not self.pk) or (not update_fields) or ('timeout' in update_fields)):
+            if not self.created:  # on creation, created will be set by parent class, so we fudge it here
+                created = now()
+            else:
+                created = self.created
+            new_expires = created + timedelta(seconds=self.timeout)
+            if new_expires != self.expires:
+                self.expires = new_expires
+                if update_fields and 'expires' not in update_fields:
+                    update_fields.append('expires')
+        elif self.timeout == 0 and ((not update_fields) or ('timeout' in update_fields)):
+            if self.expires:
+                self.expires = None
+                if update_fields and 'expires' not in update_fields:
+                    update_fields.append('expires')
+        super(WorkflowApproval, self).save(*args, **kwargs)
+
     def approve(self, request=None):
         self.status = 'successful'
         self.approved_or_denied_by = get_current_user()
         self.save()
         self.send_approval_notification('approved')
         self.websocket_emit_status(self.status)
-        schedule_task_manager()
+        ScheduleWorkflowManager().schedule()
         return reverse('api:workflow_approval_approve', kwargs={'pk': self.pk}, request=request)
 
     def deny(self, request=None):
@@ -797,7 +855,7 @@ class WorkflowApproval(UnifiedJob, JobNotificationMixin):
         self.save()
         self.send_approval_notification('denied')
         self.websocket_emit_status(self.status)
-        schedule_task_manager()
+        ScheduleWorkflowManager().schedule()
         return reverse('api:workflow_approval_deny', kwargs={'pk': self.pk}, request=request)
 
     def signal_start(self, **kwargs):
@@ -885,3 +943,12 @@ class WorkflowApproval(UnifiedJob, JobNotificationMixin):
     @property
     def workflow_job(self):
         return self.unified_job_node.workflow_job
+
+    def notification_data(self):
+        result = super(WorkflowApproval, self).notification_data()
+        result.update(
+            dict(
+                extra_vars=self.workflow_job.display_extra_vars(),
+            )
+        )
+        return result

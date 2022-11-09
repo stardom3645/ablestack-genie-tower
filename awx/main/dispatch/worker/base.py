@@ -17,6 +17,7 @@ from django.conf import settings
 
 from awx.main.dispatch.pool import WorkerPool
 from awx.main.dispatch import pg_bus_conn
+from awx.main.utils.common import log_excess_runtime
 
 if 'run_callback_receiver' in sys.argv:
     logger = logging.getLogger('awx.main.commands.run_callback_receiver')
@@ -62,7 +63,7 @@ class AWXConsumerBase(object):
     def control(self, body):
         logger.warning(f'Received control signal:\n{body}')
         control = body.get('control')
-        if control in ('status', 'running'):
+        if control in ('status', 'running', 'cancel'):
             reply_queue = body['reply_to']
             if control == 'status':
                 msg = '\n'.join([self.listening_on, self.pool.debug()])
@@ -71,6 +72,17 @@ class AWXConsumerBase(object):
                 for worker in self.pool.workers:
                     worker.calculate_managed_tasks()
                     msg.extend(worker.managed_tasks.keys())
+            elif control == 'cancel':
+                msg = []
+                task_ids = set(body['task_ids'])
+                for worker in self.pool.workers:
+                    task = worker.current_task
+                    if task and task['uuid'] in task_ids:
+                        logger.warn(f'Sending SIGTERM to task id={task["uuid"]}, task={task.get("task")}, args={task.get("args")}')
+                        os.kill(worker.pid, signal.SIGTERM)
+                        msg.append(task['uuid'])
+                if task_ids and not msg:
+                    logger.info(f'Could not locate running tasks to cancel with ids={task_ids}')
 
             with pg_bus_conn() as conn:
                 conn.notify(reply_queue, json.dumps(msg))
@@ -81,6 +93,9 @@ class AWXConsumerBase(object):
             logger.error('unrecognized control message: {}'.format(control))
 
     def process_task(self, body):
+        if isinstance(body, dict):
+            body['time_ack'] = time.time()
+
         if 'control' in body:
             try:
                 return self.control(body)
@@ -101,6 +116,7 @@ class AWXConsumerBase(object):
         self.total_messages += 1
         self.record_statistics()
 
+    @log_excess_runtime(logger)
     def record_statistics(self):
         if time.time() - self.last_stats > 1:  # buffer stat recording to once per second
             try:
@@ -149,7 +165,7 @@ class AWXConsumerPG(AWXConsumerBase):
 
         while True:
             try:
-                with pg_bus_conn() as conn:
+                with pg_bus_conn(new_connection=True) as conn:
                     for queue in self.queues:
                         conn.listen(queue)
                     if init is False:
@@ -169,8 +185,9 @@ class AWXConsumerPG(AWXConsumerBase):
                     logger.exception(f"Error consuming new events from postgres, will retry for {self.pg_max_wait} s")
                     self.pg_down_time = time.time()
                     self.pg_is_down = True
-                if time.time() - self.pg_down_time > self.pg_max_wait:
-                    logger.warning(f"Postgres event consumer has not recovered in {self.pg_max_wait} s, exiting")
+                current_downtime = time.time() - self.pg_down_time
+                if current_downtime > self.pg_max_wait:
+                    logger.exception(f"Postgres event consumer has not recovered in {current_downtime} s, exiting")
                     raise
                 # Wait for a second before next attempt, but still listen for any shutdown signals
                 for i in range(10):
@@ -179,6 +196,10 @@ class AWXConsumerPG(AWXConsumerBase):
                     time.sleep(0.1)
                 for conn in db.connections.all():
                     conn.close_if_unusable_or_obsolete()
+            except Exception:
+                # Log unanticipated exception in addition to writing to stderr to get timestamps and other metadata
+                logger.exception('Encountered unhandled error in dispatcher main loop')
+                raise
 
 
 class BaseWorker(object):

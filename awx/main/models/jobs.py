@@ -130,8 +130,7 @@ class JobOptions(BaseModel):
             )
         )
     )
-    job_tags = models.CharField(
-        max_length=1024,
+    job_tags = models.TextField(
         blank=True,
         default='',
     )
@@ -601,6 +600,19 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
     def get_ui_url(self):
         return urljoin(settings.TOWER_URL_BASE, "/#/jobs/playbook/{}".format(self.pk))
 
+    def _set_default_dependencies_processed(self):
+        """
+        This sets the initial value of dependencies_processed
+        and here we use this as a shortcut to avoid the DependencyManager for jobs that do not need it
+        """
+        if (not self.project) or self.project.scm_update_on_launch:
+            self.dependencies_processed = False
+        elif (not self.inventory) or self.inventory.inventory_sources.filter(update_on_launch=True).exists():
+            self.dependencies_processed = False
+        else:
+            # No dependencies to process
+            self.dependencies_processed = True
+
     @property
     def event_class(self):
         if self.has_unpartitioned_events:
@@ -645,8 +657,7 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
             raise ParseError(_('{status_value} is not a valid status option.').format(status_value=status))
         return self._get_hosts(**kwargs)
 
-    @property
-    def task_impact(self):
+    def _get_task_impact(self):
         if self.launch_type == 'callback':
             count_hosts = 2
         else:
@@ -744,6 +755,12 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
             return "$hidden due to Ansible no_log flag$"
         return artifacts
 
+    def get_effective_artifacts(self, **kwargs):
+        """Return unified job artifacts (from set_stats) to pass downstream in workflows"""
+        if isinstance(self.artifacts, dict):
+            return self.artifacts
+        return {}
+
     @property
     def is_container_group_task(self):
         return bool(self.instance_group and self.instance_group.is_container_group)
@@ -797,7 +814,8 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
     def _get_inventory_hosts(self, only=['name', 'ansible_facts', 'ansible_facts_modified', 'modified', 'inventory_id']):
         if not self.inventory:
             return []
-        return self.inventory.hosts.only(*only)
+        host_queryset = self.inventory.hosts.only(*only)
+        return self.inventory.get_sliced_hosts(host_queryset, self.job_slice_number, self.job_slice_count)
 
     def start_job_fact_cache(self, destination, modification_times, timeout=None):
         self.log_lifecycle("start_job_fact_cache")
@@ -842,7 +860,7 @@ class Job(UnifiedJob, JobOptions, SurveyJobMixin, JobNotificationMixin, TaskMana
                             continue
                         host.ansible_facts = ansible_facts
                         host.ansible_facts_modified = now()
-                        host.save()
+                        host.save(update_fields=['ansible_facts', 'ansible_facts_modified'])
                         system_tracking_logger.info(
                             'New fact for inventory {} host {}'.format(smart_str(host.inventory.name), smart_str(host.name)),
                             extra=dict(
@@ -1208,6 +1226,9 @@ class SystemJob(UnifiedJob, SystemJobOptions, JobNotificationMixin):
 
     extra_vars_dict = VarsDictProperty('extra_vars', True)
 
+    def _set_default_dependencies_processed(self):
+        self.dependencies_processed = True
+
     @classmethod
     def _get_parent_field_name(cls):
         return 'system_job_template'
@@ -1233,8 +1254,7 @@ class SystemJob(UnifiedJob, SystemJobOptions, JobNotificationMixin):
             return UnpartitionedSystemJobEvent
         return SystemJobEvent
 
-    @property
-    def task_impact(self):
+    def _get_task_impact(self):
         return 5
 
     @property

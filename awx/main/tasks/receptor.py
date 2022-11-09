@@ -12,6 +12,7 @@ import yaml
 
 # Django
 from django.conf import settings
+from django.db import connections
 
 # Runner
 import ansible_runner
@@ -24,10 +25,8 @@ from awx.main.utils.common import (
     parse_yaml_or_json,
     cleanup_new_process,
 )
-from awx.main.constants import (
-    MAX_ISOLATED_PATH_COLON_DELIMITER,
-    ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE,
-)
+from awx.main.constants import MAX_ISOLATED_PATH_COLON_DELIMITER
+from awx.main.tasks.signals import signal_state, signal_callback, SignalExit
 
 # Receptorctl
 from receptorctl.socket_interface import ReceptorControl
@@ -102,16 +101,22 @@ def administrative_workunit_reaper(work_list=None):
 
     for unit_id, work_data in work_list.items():
         extra_data = work_data.get('ExtraData')
-        if (extra_data is None) or (extra_data.get('RemoteWorkType') != 'ansible-runner'):
+        if extra_data is None:
             continue  # if this is not ansible-runner work, we do not want to touch it
-        params = extra_data.get('RemoteParams', {}).get('params')
-        if not params:
-            continue
-        if not (params == '--worker-info' or params.startswith('cleanup')):
-            continue  # if this is not a cleanup or health check, we do not want to touch it
-        if work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
-            continue  # do not want to touch active work units
-        logger.info(f'Reaping orphaned work unit {unit_id} with params {params}')
+        if isinstance(extra_data, str):
+            if not work_data.get('StateName', None) or work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
+                continue
+        else:
+            if extra_data.get('RemoteWorkType') != 'ansible-runner':
+                continue
+            params = extra_data.get('RemoteParams', {}).get('params')
+            if not params:
+                continue
+            if not (params == '--worker-info' or params.startswith('cleanup')):
+                continue  # if this is not a cleanup or health check, we do not want to touch it
+            if work_data.get('StateName') in RECEPTOR_ACTIVE_STATES:
+                continue  # do not want to touch active work units
+            logger.info(f'Reaping orphaned work unit {unit_id} with params {params}')
         receptor_ctl.simple_command(f"work release {unit_id}")
 
 
@@ -332,24 +337,37 @@ class AWXReceptorJob:
             shutil.rmtree(artifact_dir)
 
         resultsock, resultfile = receptor_ctl.get_work_results(self.unit_id, return_socket=True, return_sockfile=True)
-        # Both "processor" and "cancel_watcher" are spawned in separate threads.
-        # We wait for the first one to return. If cancel_watcher returns first,
-        # we yank the socket out from underneath the processor, which will cause it
-        # to exit. A reference to the processor_future is passed into the cancel_watcher_future,
-        # Which exits if the job has finished normally. The context manager ensures we do not
-        # leave any threads laying around.
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-            processor_future = executor.submit(self.processor, resultfile)
-            cancel_watcher_future = executor.submit(self.cancel_watcher, processor_future)
-            futures = [processor_future, cancel_watcher_future]
-            first_future = concurrent.futures.wait(futures, return_when=concurrent.futures.FIRST_COMPLETED)
 
-            res = list(first_future.done)[0].result()
-            if res.status == 'canceled':
+        connections.close_all()
+
+        # "processor" and the main thread will be separate threads.
+        # If a cancel happens, the main thread will encounter an exception, in which case
+        # we yank the socket out from underneath the processor, which will cause it to exit.
+        # The ThreadPoolExecutor context manager ensures we do not leave any threads laying around.
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            processor_future = executor.submit(self.processor, resultfile)
+
+            try:
+                signal_state.raise_exception = True
+                # address race condition where SIGTERM was issued after this dispatcher task started
+                if signal_callback():
+                    raise SignalExit()
+                res = processor_future.result()
+            except SignalExit:
                 receptor_ctl.simple_command(f"work cancel {self.unit_id}")
                 resultsock.shutdown(socket.SHUT_RDWR)
                 resultfile.close()
-            elif res.status == 'error':
+                result = namedtuple('result', ['status', 'rc'])
+                res = result('canceled', 1)
+            finally:
+                signal_state.raise_exception = False
+
+            if res.status == 'error':
+                # If ansible-runner ran, but an error occured at runtime, the traceback information
+                # is saved via the status_handler passed in to the processor.
+                if 'result_traceback' in self.task.runner_callback.extra_update_fields:
+                    return res
+
                 try:
                     unit_status = receptor_ctl.simple_command(f'work status {self.unit_id}')
                     detail = unit_status.get('Detail', None)
@@ -365,28 +383,19 @@ class AWXReceptorJob:
                     logger.warning(f"Could not launch pod for {log_name}. Exceeded quota.")
                     self.task.update_model(self.task.instance.pk, status='pending')
                     return
-                # If ansible-runner ran, but an error occured at runtime, the traceback information
-                # is saved via the status_handler passed in to the processor.
-                if state_name == 'Succeeded':
-                    return res
 
-                if not self.task.instance.result_traceback:
-                    try:
-                        resultsock = receptor_ctl.get_work_results(self.unit_id, return_sockfile=True)
-                        lines = resultsock.readlines()
-                        receptor_output = b"".join(lines).decode()
-                        if receptor_output:
-                            self.task.instance.result_traceback = receptor_output
-                            if 'got an unexpected keyword argument' in receptor_output:
-                                self.task.instance.result_traceback = "{}\n\n{}".format(receptor_output, ANSIBLE_RUNNER_NEEDS_UPDATE_MESSAGE)
-                            self.task.instance.save(update_fields=['result_traceback'])
-                        elif detail:
-                            self.task.instance.result_traceback = detail
-                            self.task.instance.save(update_fields=['result_traceback'])
-                        else:
-                            logger.warning(f'No result details or output from {self.task.instance.log_format}, status:\n{state_name}')
-                    except Exception:
-                        raise RuntimeError(detail)
+                try:
+                    resultsock = receptor_ctl.get_work_results(self.unit_id, return_sockfile=True)
+                    lines = resultsock.readlines()
+                    receptor_output = b"".join(lines).decode()
+                    if receptor_output:
+                        self.task.runner_callback.delay_update(result_traceback=receptor_output)
+                    elif detail:
+                        self.task.runner_callback.delay_update(result_traceback=detail)
+                    else:
+                        logger.warning(f'No result details or output from {self.task.instance.log_format}, status:\n{state_name}')
+                except Exception:
+                    raise RuntimeError(detail)
 
         return res
 
@@ -446,18 +455,6 @@ class AWXReceptorJob:
         if self.task.instance.execution_node == settings.CLUSTER_HOST_ID or self.task.instance.execution_node == self.task.instance.controller_node:
             return 'local'
         return 'ansible-runner'
-
-    @cleanup_new_process
-    def cancel_watcher(self, processor_future):
-        while True:
-            if processor_future.done():
-                return processor_future.result()
-
-            if self.task.runner_callback.cancel_callback():
-                result = namedtuple('result', ['status', 'rc'])
-                return result('canceled', 1)
-
-            time.sleep(1)
 
     @property
     def pod_definition(self):

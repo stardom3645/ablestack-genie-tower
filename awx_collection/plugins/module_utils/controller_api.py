@@ -12,7 +12,7 @@ from ansible.module_utils.six.moves.http_cookiejar import CookieJar
 from ansible.module_utils.six.moves.urllib.parse import urlparse, urlencode
 from ansible.module_utils.six.moves.configparser import ConfigParser, NoOptionError
 from distutils.version import LooseVersion as Version
-from socket import gethostbyname
+from socket import getaddrinfo, IPPROTO_TCP
 import time
 import re
 from json import loads, dumps
@@ -138,12 +138,17 @@ class ControllerModule(AnsibleModule):
         except Exception as e:
             self.fail_json(msg="Unable to parse controller_host as a URL ({1}): {0}".format(self.host, e))
 
+        # Remove ipv6 square brackets
+        remove_target = '[]'
+        for char in remove_target:
+            self.url.hostname.replace(char, "")
         # Try to resolve the hostname
-        hostname = self.url.netloc.split(':')[0]
         try:
-            gethostbyname(hostname)
+            addrinfolist = getaddrinfo(self.url.hostname, self.url.port, proto=IPPROTO_TCP)
+            for family, kind, proto, canonical, sockaddr in addrinfolist:
+                sockaddr[0]
         except Exception as e:
-            self.fail_json(msg="Unable to resolve controller_host ({1}): {0}".format(hostname, e))
+            self.fail_json(msg="Unable to resolve controller_host ({1}): {0}".format(self.url.hostname, e))
 
     def build_url(self, endpoint, query_params=None):
         # Make sure we start with /api/vX
@@ -994,7 +999,7 @@ class ControllerAPIModule(ControllerModule):
         else:
             return True
 
-    def wait_on_url(self, url, object_name, object_type, timeout=30, interval=10):
+    def wait_on_url(self, url, object_name, object_type, timeout=30, interval=2):
         # Grab our start time to compare against for the timeout
         start = time.time()
         result = self.get_endpoint(url)
@@ -1034,7 +1039,7 @@ class ControllerAPIModule(ControllerModule):
         for k in ('id', 'status', 'elapsed', 'started', 'finished'):
             self.json_output[k] = response['json'].get(k)
 
-    def wait_on_workflow_node_url(self, url, object_name, object_type, timeout=30, interval=10, **kwargs):
+    def wait_on_workflow_node_url(self, url, object_name, object_type, timeout=30, interval=2, **kwargs):
         # Grab our start time to compare against for the timeout
         start = time.time()
         result = self.get_endpoint(url, **kwargs)

@@ -12,12 +12,11 @@ from django.contrib.sessions.models import Session
 from django.utils.timezone import now, timedelta
 from django.utils.translation import gettext_lazy as _
 
-from psycopg2.errors import UntranslatableCharacter
-
 from awx.conf.license import get_license
 from awx.main.utils import get_awx_version, camelcase_to_underscore, datetime_hook
 from awx.main import models
 from awx.main.analytics import register
+from awx.main.scheduler.task_manager_models import TaskManagerInstances
 
 """
 This module is used to define metrics collected by awx.main.analytics.gather()
@@ -131,7 +130,7 @@ def config(since, **kwargs):
     }
 
 
-@register('counts', '1.1', description=_('Counts of objects such as organizations, inventories, and projects'))
+@register('counts', '1.2', description=_('Counts of objects such as organizations, inventories, and projects'))
 def counts(since, **kwargs):
     counts = {}
     for cls in (
@@ -174,6 +173,13 @@ def counts(since, **kwargs):
         .count()
     )
     counts['pending_jobs'] = models.UnifiedJob.objects.exclude(launch_type='sync').filter(status__in=('pending',)).count()
+    if connection.vendor == 'postgresql':
+        with connection.cursor() as cursor:
+            cursor.execute(f"select count(*) from pg_stat_activity where datname=\'{connection.settings_dict['NAME']}\'")
+            counts['database_connections'] = cursor.fetchone()[0]
+    else:
+        # We should be using postgresql, but if we do that change that ever we should change the below value
+        counts['database_connections'] = 1
     return counts
 
 
@@ -230,25 +236,25 @@ def projects_by_scm_type(since, **kwargs):
 @register('instance_info', '1.2', description=_('Cluster topology and capacity'))
 def instance_info(since, include_hostnames=False, **kwargs):
     info = {}
-    instances = models.Instance.objects.values_list('hostname').values(
-        'uuid', 'version', 'capacity', 'cpu', 'memory', 'managed_by_policy', 'hostname', 'enabled'
-    )
-    for instance in instances:
-        consumed_capacity = sum(x.task_impact for x in models.UnifiedJob.objects.filter(execution_node=instance['hostname'], status__in=('running', 'waiting')))
+    # Use same method that the TaskManager does to compute consumed capacity without querying all running jobs for each Instance
+    active_tasks = models.UnifiedJob.objects.filter(status__in=['running', 'waiting']).only('task_impact', 'controller_node', 'execution_node')
+    tm_instances = TaskManagerInstances(active_tasks, instance_fields=['uuid', 'version', 'capacity', 'cpu', 'memory', 'managed_by_policy', 'enabled'])
+    for tm_instance in tm_instances.instances_by_hostname.values():
+        instance = tm_instance.obj
         instance_info = {
-            'uuid': instance['uuid'],
-            'version': instance['version'],
-            'capacity': instance['capacity'],
-            'cpu': instance['cpu'],
-            'memory': instance['memory'],
-            'managed_by_policy': instance['managed_by_policy'],
-            'enabled': instance['enabled'],
-            'consumed_capacity': consumed_capacity,
-            'remaining_capacity': instance['capacity'] - consumed_capacity,
+            'uuid': instance.uuid,
+            'version': instance.version,
+            'capacity': instance.capacity,
+            'cpu': instance.cpu,
+            'memory': instance.memory,
+            'managed_by_policy': instance.managed_by_policy,
+            'enabled': instance.enabled,
+            'consumed_capacity': tm_instance.consumed_capacity,
+            'remaining_capacity': instance.capacity - tm_instance.consumed_capacity,
         }
         if include_hostnames is True:
-            instance_info['hostname'] = instance['hostname']
-        info[instance['uuid']] = instance_info
+            instance_info['hostname'] = instance.hostname
+        info[instance.uuid] = instance_info
     return info
 
 
@@ -378,10 +384,7 @@ def _events_table(since, full_path, until, tbl, where_column, project_job_create
                           WHERE ({tbl}.{where_column} > '{since.isoformat()}' AND {tbl}.{where_column} <= '{until.isoformat()}')) TO STDOUT WITH CSV HEADER'''
         return query
 
-    try:
-        return _copy_table(table='events', query=query(f"{tbl}.event_data::jsonb"), path=full_path)
-    except UntranslatableCharacter:
-        return _copy_table(table='events', query=query(f"replace({tbl}.event_data::text, '\\u0000', '')::jsonb"), path=full_path)
+    return _copy_table(table='events', query=query(fr"replace({tbl}.event_data, '\u', '\u005cu')::jsonb"), path=full_path)
 
 
 @register('events_table', '1.5', format='csv', description=_('Automation task records'), expensive=four_hour_slicing)
@@ -394,7 +397,7 @@ def events_table_partitioned_modified(since, full_path, until, **kwargs):
     return _events_table(since, full_path, until, 'main_jobevent', 'modified', project_job_created=True, **kwargs)
 
 
-@register('unified_jobs_table', '1.3', format='csv', description=_('Data on jobs run'), expensive=four_hour_slicing)
+@register('unified_jobs_table', '1.4', format='csv', description=_('Data on jobs run'), expensive=four_hour_slicing)
 def unified_jobs_table(since, full_path, until, **kwargs):
     unified_job_query = '''COPY (SELECT main_unifiedjob.id,
                                  main_unifiedjob.polymorphic_ctype_id,
@@ -420,7 +423,8 @@ def unified_jobs_table(since, full_path, until, **kwargs):
                                  main_unifiedjob.job_explanation,
                                  main_unifiedjob.instance_group_id,
                                  main_unifiedjob.installed_collections,
-                                 main_unifiedjob.ansible_version
+                                 main_unifiedjob.ansible_version,
+                                 main_job.forks
                                  FROM main_unifiedjob
                                  JOIN django_content_type ON main_unifiedjob.polymorphic_ctype_id = django_content_type.id
                                  LEFT JOIN main_job ON main_unifiedjob.id = main_job.unifiedjob_ptr_id
